@@ -431,8 +431,10 @@ class PyVerilator:
                          + verilog_path_args \
                          + verilog_defines \
                          + ['-CFLAGS',
-                           '-fPIC -shared --std=c++11 -DVL_USER_FINISH',
+                           '-fPIC -O3',
                             '--trace',
+                            '--trace-params',
+                            '--x-assign', '1',
                             '--cc',
                             top_verilog_file,
                             '--exe',
