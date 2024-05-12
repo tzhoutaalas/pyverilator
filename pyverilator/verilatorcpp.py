@@ -1,11 +1,13 @@
+import re
+
 def header_cpp(top_module):
     s = """#include <cstddef>
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 #include "{module_filename}.h"
+#define UINT32_TO_UINT32(u) (*((uint32_t *)&(u)))
     """.format(module_filename='V' + top_module)
     return s
-
 
 def var_declaration_cpp(top_module, inputs, outputs, internal_signals, json_data):
     s = """// pyverilator defined values
@@ -129,24 +131,113 @@ void set_command_args(int argc, char** argv) {{
     Verilated::commandArgs(argc, argv);
 }}
 """.format(module_filename='V' + top_module)
+
+    def port_name(port):
+        return re.sub(r'\(|\&|\[.*?\]|\)', '', port[0])
+    def num_slices(port):
+        start_index = port[0].find('[')
+        end_index = port[0].find(']', start_index)
+        if start_index != -1 and end_index != -1:
+            return int(port[0][start_index + 1:end_index])
+        return 1
+
+    sample_output_functions = ""
+    single_slice_ports = []
+    for port in outputs + inputs + internal_signals:
+        if num_slices(port) == 1:
+            single_slice_ports.append(port)
+            if port[1] <= 64:
+                sample_output_functions += """void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+    *out = (int32_t)top->{port_name};
+}}
+""".format(module_filename='V' + top_module, port_name=port_name(port))
+            else:
+                sample_output_functions += """void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+    int i = 0;
+    for (int j = 0; j < num_elements; j++) {{
+        out[i] = (int32_t)top->{port_name}[j];
+        i++;
+    }}
+}}
+""".format(module_filename='V' + top_module, port_name=port_name(port))
+        else:
+            if port[1] <= 64:
+                sample_output_functions += """void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+    for (int slice = 0; slice < {num_slices}; slice++) {{
+        out[slice] = (int32_t)top->{port_name}[slice];
+    }}
+}}
+""".format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+            else:
+                sample_output_functions += """void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+    int i = 0;
+    for (int slice = 0; slice < {num_slices}; slice++) {{
+        for (int j = 0; j < num_elements / {num_slices}; j++) {{
+            out[i] = (int32_t)top->{port_name}[slice][j];
+            i++;
+        }}
+    }}
+}}
+""".format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+
+    drive_input_functions = ""
+    single_slice_inputs = []
+    for port in inputs:
+        if num_slices(port) == 1:
+            single_slice_inputs.append(port)
+            if port[1] <= 64:
+                drive_input_functions += """void drive_{port_name}({module_filename}* top, int32_t *in, const int num_elements) {{
+        top->{port_name} = UINT32_TO_UINT32(in);
+}}
+""".format(module_filename='V' + top_module, port_name=port_name(port))
+            else:
+                drive_input_functions += """void drive_{port_name}({module_filename}* top, int32_t *in, const int num_elements) {{
+    int i = 0;
+    for (int j = 0; j < num_elements; j++) {{
+        top->{port_name}[j] = UINT32_TO_UINT32(in[i]);
+    }}
+}}
+""".format(module_filename='V' + top_module, port_name=port_name(port))
+        else:
+            if port[1] <= 64:
+                drive_input_functions += """void drive_{port_name}({module_filename}* top, int32_t *in, const int num_elements) {{
+    for (int slice = 0; slice < {num_slices}; slice++) {{
+        top->{port_name}[slice] = UINT32_TO_UINT32(in);
+    }}
+}}
+""".format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+            else:
+                drive_input_functions += """void drive_{port_name}({module_filename}* top, int32_t *in, const int num_elements) {{
+    int i = 0;
+    for (int slice = 0; slice < {num_slices}; slice++) {{
+        for (int j = 0; j < num_elements / {num_slices}; j++) {{
+            top->{port_name}[slice][j] = UINT32_TO_UINT32(in[i]);
+        }}
+    }}
+}}
+""".format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+
     get_functions = "\n".join(map(lambda port: (
         "uint32_t get_{portname}({module_filename}* top, int word)"
         "{{ return top->{portname}[word];}}" if port[1] > 64 else (
             "uint64_t get_{portname}({module_filename}* top)"
             "{{return top->{portname};}}" if port[1] > 32 else
             "uint32_t get_{portname}({module_filename}* top)"
-            "{{return top->{portname};}}")).format(module_filename='V' + top_module, portname=port[0]),
-                                  outputs + inputs + internal_signals))
+            "{{return top->{portname};}}")).format(module_filename='V' + top_module, portname=port_name(port)),
+                                  single_slice_ports))
     set_functions = "\n".join(map(lambda port: (
         "int set_{portname}({module_filename}* top, int word, uint64_t new_value)"
         "{{ top->{portname}[word] = new_value; return 0;}}" if port[1] > 64 else (
             "int set_{portname}({module_filename}* top, uint64_t new_value)"
             "{{ top->{portname} = new_value; return 0;}}" if port[1] > 32 else
             "int set_{portname}({module_filename}* top, uint32_t new_value)"
-            "{{ top->{portname} = new_value; return 0;}}")).format(module_filename='V' + top_module, portname=port[0])
-                                  , inputs))
+            "{{ top->{portname} = new_value; return 0;}}")).format(module_filename='V' + top_module, portname=port_name(port)),
+                                  single_slice_inputs))
     footer = "}"
-    return "\n".join([constant_part, get_functions, set_functions, footer])
+    comments = "\n// inputs \n// " + "\n// ".join(map(lambda port: f"{port}", inputs))
+    comments += "\n// outputs \n// " + "\n// ".join(map(lambda port: f"{port}", outputs))
+    comments += "\n// internal \n// " + "\n// ".join(map(lambda port: f"{port}", internal_signals))
+    return "\n".join([constant_part, sample_output_functions, drive_input_functions, get_functions, set_functions, footer, comments])
 
 
 def template_cpp(top_module, inputs, outputs, internal_signals, json_data):

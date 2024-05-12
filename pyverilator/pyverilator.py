@@ -9,6 +9,7 @@ import sys
 from keyword import iskeyword
 import pyverilator.verilatorcpp as template_cpp
 import tclwrapper
+from numpy.ctypeslib import ndpointer
 
 def verilator_name_to_standard_modular_name(verilator_name):
     """Converts a name exposed in Verilator to its standard name.
@@ -431,7 +432,7 @@ class PyVerilator:
                          + verilog_path_args \
                          + verilog_defines \
                          + ['-CFLAGS',
-                           '-fPIC -O3',
+                           '-fPIC -O3 -DVL_USER_FINISH',
                             '--trace',
                             '--trace-params',
                             '--x-assign', '1',
@@ -584,16 +585,16 @@ class PyVerilator:
         io_dict = {}
         internals_dict = {}
         for sig_name, width in self.inputs:
-            sig = Input(self, sig_name, width)
-            io_dict[sig.short_name] = sig
+            sig = Input(self, self._port_name(sig_name), width)
+            io_dict[self._port_name(sig.short_name)] = sig
             all_signals[sig.modular_name] = sig
         for sig_name, width in self.outputs:
-            sig = Output(self, sig_name, width)
-            io_dict[sig.short_name] = sig
+            sig = Output(self, self._port_name(sig_name), width)
+            io_dict[self._port_name(sig.short_name)] = sig
             all_signals[sig.modular_name] = sig
         for sig_name, width in self.internal_signals:
-            sig = InternalSignal(self, sig_name, width)
-            internals_dict[sig.modular_name] = sig
+            sig = InternalSignal(self, self._port_name(sig_name), width)
+            internals_dict[self._port_name(sig.short_name)] = sig
             all_signals[sig.modular_name] = sig
         self.io = Collection(io_dict)
         self.internals = Collection.build_nested_collection(internals_dict, Submodule)
@@ -602,7 +603,7 @@ class PyVerilator:
     def _read(self, port_name):
         port_width = None
         for name, width in self.inputs + self.outputs + self.internal_signals:
-            if port_name == name:
+            if port_name == self._port_name(name):
                 port_width = width
         if port_width is None:
             raise ValueError('cannot read port "%s" because it does not exist' % port_name)
@@ -615,19 +616,19 @@ class PyVerilator:
             return self._read_32(port_name)
 
     def _read_32(self, port_name):
-        fn = getattr(self.lib, 'get_' + port_name)
+        fn = getattr(self.lib, 'get_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p]
         fn.restype = ctypes.c_uint32
         return int(fn(self.model))
 
     def _read_64(self, port_name):
-        fn = getattr(self.lib, 'get_' + port_name)
+        fn = getattr(self.lib, 'get_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p]
         fn.restype = ctypes.c_uint64
         return int(fn(self.model))
 
     def _read_words(self, port_name, num_words):
-        fn = getattr(self.lib, 'get_' + port_name)
+        fn = getattr(self.lib, 'get_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         fn.restype = ctypes.c_uint32
         words = [0] * num_words
@@ -638,14 +639,32 @@ class PyVerilator:
             out |= words[i] << (i * 32)
         return out
 
+    def _port_name(self, port):
+        return re.sub(r'\(|\&|\[.*?\]|\)', '', port)
+
+    def _port_slices(self, port):
+        start_index = port.find('[')
+        end_index = port.find(']', start_index)
+        if start_index != -1 and end_index != -1:
+            return int(port[start_index + 1:end_index])
+        return 1
+
     def _write(self, port_name, value):
         port_width = None
+        port_slices = None
         for name, width in self.inputs:
-            if port_name == name:
+            if port_name == self._port_name(name):
                 port_width = width
+                port_slices = self._port_slices(name)
         if port_width is None:
             raise ValueError('cannot write port "%s" because it does not exist (or it is an output)' % port_name)
-        if port_width > 64:
+
+        if port_slices > 1:
+            fn = getattr(self.lib, 'drive_' + self._port_name(port_name))
+            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32, flags="C_CONTIGUOUS"), ctypes.c_size_t]
+            fn( self.model, value, value.size )
+            self._post_write_hook(port_name, value)
+        elif port_width > 64:
             num_words = (port_width + 31) // 32
             self._write_words(port_name, num_words, value)
         elif port_width > 32:
@@ -654,19 +673,19 @@ class PyVerilator:
             self._write_32(port_name, value)
 
     def _write_32(self, port_name, value):
-        fn = getattr(self.lib, 'set_' + port_name)
+        fn = getattr(self.lib, 'set_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         fn( self.model, ctypes.c_uint32(value) )
         self._post_write_hook(port_name, value)
 
     def _write_64(self, port_name, value):
-        fn = getattr(self.lib, 'set_' + port_name)
+        fn = getattr(self.lib, 'set_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         fn( self.model, ctypes.c_uint64(value) )
         self._post_write_hook(port_name, value)
 
     def _write_words(self, port_name, num_words, value):
-        fn = getattr(self.lib, 'set_' + port_name)
+        fn = getattr(self.lib, 'set_' + self._port_name(port_name))
         fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32]
         for i in range(num_words):
             word = ctypes.c_uint32(value >> (i * 32))
@@ -680,10 +699,12 @@ class PyVerilator:
             self.add_to_vcd_trace()
 
     def _sim_init(self):
+        # Tony: I'd rather let Xs run wild!
+        return
         # initialize all the inputs to 0
-        input_names = [name for name, _ in self.inputs]
-        for name in input_names:
-            self._write(name, 0)
+        # input_names = [name for name, _ in self.inputs]
+        # for name in input_names:
+        #     self._write(name, 0)
 
     def __getitem__(self, signal_name):
         return self._read(signal_name)
