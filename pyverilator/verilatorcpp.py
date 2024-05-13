@@ -2,6 +2,7 @@ import re
 
 def header_cpp(top_module):
     s = """#include <cstddef>
+#include <iostream>
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 #include "{module_filename}.h"
@@ -149,30 +150,30 @@ void set_command_args(int argc, char** argv) {{
         if num_slices(port) == 1:
             single_slice_ports.append(port)
             sample_output_functions += (
-"""int32_t get_{port_name}_element({module_filename}* top, int index) {{
+"""uint32_t get_{port_name}_element({module_filename}* top, int index) {{
     return top->{port_name};
 }}
 """ if port[1] <= 32 else 
-"""int64_t get_{port_name}_element({module_filename}* top, int index) {{
+"""uint64_t get_{port_name}_element({module_filename}* top, int index) {{
     return top->{port_name};
 }}
 """ if port[1] <= 64 else 
-"""int32_t get_{port_name}_element({module_filename}* top, int index) {{
+"""uint32_t get_{port_name}_element({module_filename}* top, int index) {{
     return top->{port_name}[index];
 }}
 """).format(module_filename='V' + top_module, port_name=port_name(port))
             sample_output_functions += (
-"""void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+"""void sample_{port_name}({module_filename}* top, void* out, const int num_elements) {{
     for (int i = 0; i < num_elements; i+=2) {{
-        int64_t val = get_{port_name}_element(top, i);
-        out[i] = val & 0xFFFFFFFF;
-        out[i+1] = (val >> 32) & 0xFFFFFFFF;
+        uint64_t val = get_{port_name}_element(top, i);
+        ((uint32_t *)out)[i] = val & 0xFFFFFFFF;
+        ((uint32_t *)out)[i+1] = (val >> 32) & 0xFFFFFFFF;
     }}
 }}
 """ if port[1] == 64 else
-"""void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+"""void sample_{port_name}({module_filename}* top, void* out, const int num_elements) {{
     for (int i = 0; i < num_elements; i++) {{
-        out[i] = get_{port_name}_element(top, i);
+        ((uint32_t *)out)[i] = get_{port_name}_element(top, i);
     }}
 }}
 """).format(module_filename='V' + top_module, port_name=port_name(port))
@@ -180,37 +181,45 @@ void set_command_args(int argc, char** argv) {{
         # Multi-dimensional Ports
         else:
             sample_output_functions += (
-"""int32_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
+"""uint32_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
     return top->{port_name}[slice];
 }}
 """ if port[1] <= 32 else 
-"""int64_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
+"""uint64_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
     return top->{port_name}[slice];
 }}
 """ if port[1] <= 64 else 
-"""int32_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
+"""uint32_t get_{port_name}_element({module_filename}* top, int slice, int index) {{
     return top->{port_name}[slice][index];
 }}
 """).format(module_filename='V' + top_module, port_name=port_name(port))
             sample_output_functions += (
-"""void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+"""void sample_{port_name}({module_filename}* top, void* out, const int num_elements) {{
     int i = 0;
     for (int slice = 0; slice < {num_slices}; slice++) {{
-        for (int j = 0; j < num_elements; i+=2, j+=2) {{
-            int64_t val = get_{port_name}_element(top, slice, j);
-            out[i] = val & 0xFFFFFFFF;
-            out[i+1] = (val >> 32) & 0xFFFFFFFF;
+        for (int j = 0; j < num_elements / {num_slices}; i+=2, j+=2) {{
+            uint64_t val = get_{port_name}_element(top, slice, j);
+            ((uint32_t *)out)[i] = val & 0xFFFFFFFF;
+            ((uint32_t *)out)[i+1] = (val >> 32) & 0xFFFFFFFF;
         }}
     }}
 }}
+void sample_{port_name}_element({module_filename}* top, void* out, const int slice, const int index) {{
+    uint64_t val = get_{port_name}_element(top, slice, index);
+    ((uint32_t *)out)[0] = val & 0xFFFFFFFF;
+    ((uint32_t *)out)[1] = (val >> 32) & 0xFFFFFFFF;
+}}
 """ if port[1] == 64 else
-"""void sample_{port_name}({module_filename}* top, int32_t *out, const int num_elements) {{
+"""void sample_{port_name}({module_filename}* top, void* out, const int num_elements) {{
     int i = 0;
     for (int slice = 0; slice < {num_slices}; slice++) {{
-        for (int j = 0; j < num_elements; i++, j++) {{
-            out[i] = get_{port_name}_element(top, slice, j);
+        for (int j = 0; j < num_elements / {num_slices}; i++, j++) {{
+            ((uint32_t *)out)[i] = get_{port_name}_element(top, slice, j);
         }}
     }}
+}}
+void sample_{port_name}_element({module_filename}* top, void* out, const int slice, const int index) {{
+    ((uint32_t *)out)[0] = get_{port_name}_element(top, slice, index);
 }}
 """).format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
 
@@ -234,65 +243,65 @@ void set_command_args(int argc, char** argv) {{
 }}
 """).format(module_filename='V' + top_module, port_name=port_name(port))
             drive_input_functions += (
-"""
-void drive_{port_name}({module_filename}* top, const int32_t *in, const int num_elements) {{
+"""void drive_{port_name}({module_filename}* top, const void* in, const int num_elements) {{
     for (int i = 0; i < num_elements; i+=2) {{
-        int64_t hi = in[i+1] & 0xFFFFFFFF;
-        int64_t lo = in[i] & 0xFFFFFFFF;
+        int64_t hi = ((int32_t *)in)[i+1] & 0xFFFFFFFF;
+        int64_t lo = ((int32_t *)in)[i] & 0xFFFFFFFF;
         set_{port_name}_element(top, ((hi<<32)|lo), i);
     }}
 }}
-""" if port[1] == 64 else
-"""
-void drive_{port_name}({module_filename}* top, const int32_t *in, const int num_elements) {{
+""" if port[1] == 64 else """
+void drive_{port_name}({module_filename}* top, const void* in, const int num_elements) {{
     for (int i = 0; i < num_elements; i++) {{
-        set_{port_name}_element(top, in[i], i);
+        set_{port_name}_element(top, ((int32_t *)in)[i], i);
     }}
 }}
 """).format(module_filename='V' + top_module, port_name=port_name(port))
+            drive_input_functions += """
+void drive_{port_name}_element({module_filename}* top, const void* in, int index) {{
+    set_{port_name}_element(top, *((int32_t *)in), index);
+}}
+""".format(module_filename='V' + top_module, port_name=port_name(port))
 
         # Multi-dimensional Ports
         else:
             drive_input_functions += (
 """void set_{port_name}_element({module_filename}* top, int32_t val, int slice, int index) {{
-    for (int slice = 0; slice < {num_slices}; slice++) {{
-        top->{port_name}[slice] = UINT32_TO_UINT32(val);
-    }}
+    top->{port_name}[slice] = UINT32_TO_UINT32(val);
 }}
 """ if port[1] <= 32 else 
 """void set_{port_name}_element({module_filename}* top, int64_t val, int slice, int index) {{
-    for (int slice = 0; slice < {num_slices}; slice++) {{
-        top->{port_name}[slice] = UINT64_TO_UINT64(val);
-    }}
+    top->{port_name}[slice] = UINT64_TO_UINT64(val);
 }}
 """ if port[1] <= 64 else 
 """void set_{port_name}_element({module_filename}* top, int32_t val, int slice, int index) {{
-    for (int slice = 0; slice < {num_slices}; slice++) {{
-        top->{port_name}[slice][index] = UINT32_TO_UINT32(val);
-    }}
+    top->{port_name}[slice][index] = UINT32_TO_UINT32(val);
 }}
 """).format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
             drive_input_functions += (
-"""void drive_{port_name}({module_filename}* top, const int32_t *in, int num_elements) {{
+"""void drive_{port_name}({module_filename}* top, const void* in, int num_elements) {{
     int i = 0;
     for (int slice = 0; slice < {num_slices}; slice++) {{
         for (int j = 0; j < num_elements / {num_slices}; i+=2, j+=2) {{
-            int64_t hi = in[i+1] & 0xFFFFFFFF;
-            int64_t lo = in[i] & 0xFFFFFFFF;
+            int64_t hi = ((int32_t *)in)[i+1] & 0xFFFFFFFF;
+            int64_t lo = ((int32_t *)in)[i] & 0xFFFFFFFF;
             set_{port_name}_element(top, ((hi<<32)|lo), slice, j);
         }}
     }}
-}}
-""" if port[1] == 64 else
-"""void drive_{port_name}({module_filename}* top, const int32_t *in, int num_elements) {{
+}}""" if port[1] == 64 else
+"""void drive_{port_name}({module_filename}* top, const void* in, int num_elements) {{
     int i = 0;
     for (int slice = 0; slice < {num_slices}; slice++) {{
         for (int j = 0; j < num_elements / {num_slices}; i++, j++) {{
-            set_{port_name}_element(top, in[i], slice, j);
+            set_{port_name}_element(top, ((int32_t *)in)[i], slice, j);
         }}
     }}
+}}""").format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+            drive_input_functions += """
+void drive_{port_name}_element({module_filename}* top, const void* in, int slice, int index) {{
+    set_{port_name}_element(top, *((int32_t *)in), slice, index);
 }}
-""").format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
+""".format(module_filename='V' + top_module, num_slices=num_slices(port), port_name=port_name(port))
 
     # Setters and getters can only be used for 1D ports
     get_functions = "\n".join(map(lambda port: (

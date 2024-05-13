@@ -9,6 +9,7 @@ import sys
 from keyword import iskeyword
 import pyverilator.verilatorcpp as template_cpp
 import tclwrapper
+import numpy as np
 from numpy.ctypeslib import ndpointer
 
 def verilator_name_to_standard_modular_name(verilator_name):
@@ -313,12 +314,7 @@ class InternalSignal(Signal):
 class Input(Signal):
     def __init__(self, pyverilator_sim, verilator_name, width):
         super().__init__(pyverilator_sim, verilator_name, width)
-        if width <= 32:
-            self.write_function_and_args = (self.sim_object._write_32, self.verilator_name)
-        elif width <= 64:
-            self.write_function_and_args = (self.sim_object._write_64, self.verilator_name)
-        else:
-            self.write_function_and_args = (self.sim_object._write_words, self.verilator_name, (width + 31) // 32)
+        self.write_function_and_args = (self.sim_object._write, self.verilator_name)
 
     def write(self, value):
         self.write_function_and_args[0](*self.write_function_and_args[1:], value)
@@ -600,13 +596,29 @@ class PyVerilator:
         self.internals = Collection.build_nested_collection(internals_dict, Submodule)
         self.all_signals = all_signals
 
+    def _port_name(self, port):
+        return re.sub(r'\(|\&|\[.*?\]|\)', '', port)
+
+    def _port_slices(self, port):
+        start_index = port.find('[')
+        end_index = port.find(']', start_index)
+        if start_index != -1 and end_index != -1:
+            return int(port[start_index + 1:end_index])
+        return 1
+
     def _read(self, port_name):
         port_width = None
+        port_slices = None
         for name, width in self.inputs + self.outputs + self.internal_signals:
             if port_name == self._port_name(name):
                 port_width = width
+                port_slices = self._port_slices(name)
         if port_width is None:
             raise ValueError('cannot read port "%s" because it does not exist' % port_name)
+
+        if port_slices > 1:
+            raise ValueError('cannot read multi-dimensional port, use sample_%s instead' % port_name)
+
         if port_width > 64:
             num_words = (port_width + 31) // 32
             return self._read_words(port_name, num_words)
@@ -639,16 +651,6 @@ class PyVerilator:
             out |= words[i] << (i * 32)
         return out
 
-    def _port_name(self, port):
-        return re.sub(r'\(|\&|\[.*?\]|\)', '', port)
-
-    def _port_slices(self, port):
-        start_index = port.find('[')
-        end_index = port.find(']', start_index)
-        if start_index != -1 and end_index != -1:
-            return int(port[start_index + 1:end_index])
-        return 1
-
     def _write(self, port_name, value):
         port_width = None
         port_slices = None
@@ -660,10 +662,7 @@ class PyVerilator:
             raise ValueError('cannot write port "%s" because it does not exist (or it is an output)' % port_name)
 
         if port_slices > 1:
-            fn = getattr(self.lib, 'drive_' + self._port_name(port_name))
-            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32, flags="C_CONTIGUOUS"), ctypes.c_size_t]
-            fn( self.model, value, value.size )
-            self._post_write_hook(port_name, value)
+            self.drive(port_name, value)
         elif port_width > 64:
             num_words = (port_width + 31) // 32
             self._write_words(port_name, num_words, value)
@@ -718,6 +717,76 @@ class PyVerilator:
                 return True
         return False
 
+    def sample(self, port_name, out):
+        port_width = None
+        port_slices = None
+        port_exists = None
+        for name, width in self.inputs + self.outputs + self.internal_signals:
+            if self._port_name(port_name) == self._port_name(name):
+                port_width = width
+                port_slices = self._port_slices(name)
+                port_exists = True
+                break
+        if port_exists is None:
+            raise ValueError('cannot write port "%s" because it does not exist (or it is an output)' % port_name)
+
+        pattern = r'\[(\d+)\]'
+        indices = re.findall(pattern, port_name)
+        indices = [int(idx) for idx in indices]
+
+        if len(indices) > 0:
+            slice = 0 if len(indices) == 0 else indices[0]
+            index = 0 if len(indices) == 1 else indices[1]
+            if slice >= port_slices:
+                raise ValueError('cannot write port "%s" because slice exceeds the max' % port_name)
+            i32 = out.dtype == np.int32
+            fn = getattr(self.lib, 'sample_' + self._port_name(port_name) + '_element')
+            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32 if i32 else ctypes.c_uint32, flags="C_CONTIGUOUS"), ctypes.c_int, ctypes.c_int]
+            fn( self.model, out, slice, index )
+        else:
+            i32 = out.dtype == np.int32
+            fn = getattr(self.lib, 'sample_' + self._port_name(port_name))
+            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32 if i32 else ctypes.c_uint32, flags="C_CONTIGUOUS"), ctypes.c_size_t]
+            fn( self.model, out, out.size )
+
+    def drive(self, port_name, value):
+        port_width = None
+        port_slices = None
+        port_exists = None
+        for name, width in self.inputs:
+            if self._port_name(port_name) == self._port_name(name):
+                port_width = width
+                port_slices = self._port_slices(name)
+                port_exists = True
+                break
+        if port_exists is None:
+            raise ValueError('cannot write port "%s" because it does not exist (or it is an output)' % port_name)
+
+        pattern = r'\[(\d+)\]'
+        indices = re.findall(pattern, port_name)
+        indices = [int(idx) for idx in indices]
+
+        if hasattr(value, 'dtype'):
+            value_ = value
+        else:
+            value_ = np.full(1, value, dtype=np.intc)
+
+        i32 = value_.dtype == np.int32
+        if len(indices) > 0:
+            slice = 0 if len(indices) == 0 else indices[0]
+            index = 0 if len(indices) == 1 else indices[1]
+            if slice >= port_slices:
+                raise ValueError('cannot write port "%s" because slice exceeds the max' % port_name)
+            fn = getattr(self.lib, 'drive_' + self._port_name(port_name) + '_element')
+            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32 if i32 else ctypes.c_uint32, flags="C_CONTIGUOUS"), ctypes.c_int, ctypes.c_int]
+            fn( self.model, value_, slice, index)
+            self._post_write_hook(port_name, value_)
+        else:
+            fn = getattr(self.lib, 'drive_' + self._port_name(port_name))
+            fn.argtypes = [ctypes.c_void_p, ndpointer(ctypes.c_int32 if i32 else ctypes.c_uint32, flags="C_CONTIGUOUS"), ctypes.c_size_t]
+            fn( self.model, value_, value_.size )
+            self._post_write_hook(port_name, value_)
+
     @property
     def finished(self):
         return self.lib.get_finished()
@@ -762,11 +831,8 @@ class PyVerilator:
             raise ValueError('add_to_vcd_trace() requires VCD tracing to be active')
         add_to_vcd_trace = self.lib.add_to_vcd_trace
         add_to_vcd_trace.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        # do two steps so the most recent value in GTKWave is more obvious
-        self.curr_time += 5
         add_to_vcd_trace(self.vcd_trace, self.curr_time)
-        self.curr_time += 5
-        add_to_vcd_trace(self.vcd_trace, self.curr_time)
+        self.curr_time += 1
         # go ahead and flush on each vcd update
         self.flush_vcd_trace()
 
