@@ -4,6 +4,16 @@ PyVerilator
 This package provides a wrapper to generate and use verilator
 hardware models in python.
 
+Taalas Additions
+----------------
+
+Taalas fork of PyVerilator includes additional features:
+
+#. Port parser that is compatible non-trivial names found in verilated code like ``(&port)``
+#. Support for driving and sampling multi-dimensional ports such as ``[SLICE-1:0] port [WIDTH-1:0]``
+#. Support for NumPy's ndarray data type as input and output to/from the verilated design
+#. Configurations that make more sense (default clock period, non-initialized internal signals)
+
 Usage
 -----
 
